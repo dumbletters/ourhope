@@ -1,1 +1,1 @@
-worker: python ourhope.py
+web: python main.py

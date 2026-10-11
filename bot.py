@@ -57,6 +57,9 @@ def init_db():
         con.execute("""CREATE TABLE IF NOT EXISTS blacklist_role_backups (
             guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, role_ids TEXT NOT NULL,
             PRIMARY KEY (guild_id, user_id))""")
+        con.execute("""CREATE TABLE IF NOT EXISTS mod_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, moderator_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL)""")
 
 
 class OurhopeBot(commands.Bot):
@@ -65,10 +68,9 @@ class OurhopeBot(commands.Bot):
         intents.guilds = True
         intents.members = True
         intents.message_content = True
-        super().__init__(command_prefix="?", intents=intents, help_command=None)
+        super().__init__(command_prefix=commands.when_mentioned_or("?", ","), intents=intents, help_command=None)
         self.spam_cache: dict[tuple[int, int], list[tuple[str, float]]] = {}
         self.last_message_hash: dict[tuple[int, int], tuple[str, int, float]] = {}
-        self.join_times: dict[int, list[float]] = {}
 
     async def setup_hook(self):
         init_db()
@@ -85,20 +87,6 @@ class OurhopeBot(commands.Bot):
     async def on_ready(self):
         print(f"{BOT_NAME} online as {self.user} (ID: {self.user.id})")
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="over the community"))
-
-    async def on_member_join(self, member: discord.Member):
-        # Simple join-spike detection: 8 joins within 15 seconds enables a one-hour
-        # verification timeout only when Discord permits it; otherwise logs for staff.
-        now = time.time()
-        joins = self.join_times.setdefault(member.guild.id, [])
-        joins[:] = [stamp for stamp in joins if now - stamp <= 15]
-        joins.append(now)
-        if len(joins) >= 8:
-            try:
-                await member.timeout(timedelta(hours=1), reason="ourhope anti-raid: join spike")
-                await send_mod_log(member.guild, "Anti-raid join spike", member, "8+ joins within 15 seconds; new join temporarily timed out")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
 
     async def on_guild_channel_create(self, channel):
         # A blacklist deny must apply to channels created after a member was blacklisted.
@@ -643,6 +631,159 @@ async def before_giveaway_watcher():
 
 
 
+# Prefix moderation shortcuts requested by the server owner.
+def record_mod_action(guild_id: int, moderator_id: int, target_id: int, action: str, reason: str):
+    with db_connect() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS mod_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, moderator_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL)""")
+        con.execute("INSERT INTO mod_actions(guild_id,moderator_id,target_id,action,reason,created_at) VALUES(?,?,?,?,?,?)",
+                    (guild_id, moderator_id, target_id, action, (reason or "No reason provided")[:1000], time.time()))
+
+
+def can_moderate(ctx: commands.Context, member: discord.Member) -> bool:
+    if not isinstance(ctx.author, discord.Member) or not ctx.guild or not ctx.guild.me:
+        return False
+    if member.id == ctx.author.id or member.id == ctx.guild.owner_id:
+        return False
+    if member.top_role >= ctx.guild.me.top_role or member.guild_permissions.administrator:
+        return False
+    if ctx.author.id != ctx.guild.owner_id and member.top_role >= ctx.author.top_role:
+        return False
+    return True
+
+
+def parse_reason_marker(text: str, default: str = "No reason provided") -> str:
+    """Accept the Bleed-style '?r reason' marker, while tolerating plain reasons."""
+    text = (text or "").strip()
+    if not text:
+        return default
+    import re
+    match = re.search(r"(?:^|\s)\?r\s+(.+)$", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip() or default
+    return text
+
+
+def parse_timeout_duration(value: str) -> int:
+    """Parse 30m, 2h, 1d; Discord timeout maximum is 28 days."""
+    import re
+    match = re.fullmatch(r"\s*(\d+)\s*([mhd])\s*", value.lower())
+    if not match:
+        raise ValueError("Use a duration like `30m`, `2h`, or `1d`.")
+    amount, unit = int(match.group(1)), match.group(2)
+    minutes = amount * {"m": 1, "h": 60, "d": 1440}[unit]
+    if minutes < 1 or minutes > 28 * 24 * 60:
+        raise ValueError("Timeout must be between 1 minute and 28 days.")
+    return minutes
+
+
+@bot.command(name="m")
+@commands.guild_only()
+async def mute_shortcut(ctx: commands.Context, member: discord.Member, duration: str = "10m", *, reason: str = ""):
+    """Usage: ,m @member 30m ?r reason (maximum 28 days)."""
+    try:
+        minutes = parse_timeout_duration(duration)
+    except ValueError as exc:
+        return await ctx.reply(str(exc), mention_author=False)
+    reason = parse_reason_marker(reason)
+    if not ctx.author.guild_permissions.moderate_members:
+        return await ctx.reply("You need **Timeout Members** permission.", mention_author=False)
+    if not can_moderate(ctx, member):
+        return await ctx.reply("I can't moderate that member because of role hierarchy or permissions.", mention_author=False)
+    try:
+        await member.timeout(timedelta(minutes=minutes), reason=f"{ctx.author}: {reason}")
+        record_mod_action(ctx.guild.id, ctx.author.id, member.id, "Mute/timeout", reason)
+        duration_text = f"{minutes} minutes" if minutes < 60 else (f"{minutes // 60} hours" if minutes < 1440 else f"{minutes // 1440} days")
+        await ctx.reply(f"🔇 Timed out {member.mention} for **{duration_text}**. Reason: {reason}", mention_author=False)
+        await send_mod_log(ctx.guild, "Manual timeout", member, f"By {ctx.author} · {duration_text} · {reason}")
+    except discord.Forbidden:
+        await ctx.reply("I need **Moderate Members** permission and a higher role than that member.", mention_author=False)
+
+
+@bot.command(name="k")
+@commands.guild_only()
+async def kick_shortcut(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    """Usage: ,k @member ?r reason"""
+    reason = parse_reason_marker(reason)
+    if not ctx.author.guild_permissions.kick_members:
+        return await ctx.reply("You need **Kick Members** permission.", mention_author=False)
+    if not can_moderate(ctx, member):
+        return await ctx.reply("I can't moderate that member because of role hierarchy or permissions.", mention_author=False)
+    try:
+        await member.kick(reason=f"{ctx.author}: {reason}")
+        record_mod_action(ctx.guild.id, ctx.author.id, member.id, "Kick", reason)
+        await ctx.reply(f"👢 Kicked **{member}**. Reason: {reason}", mention_author=False)
+    except discord.Forbidden:
+        await ctx.reply("I need **Kick Members** permission and a higher role than that member.", mention_author=False)
+
+
+@bot.command(name="b")
+@commands.guild_only()
+async def ban_shortcut(ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+    """Usage: ,b @member ?r reason"""
+    reason = parse_reason_marker(reason)
+    if not ctx.author.guild_permissions.ban_members:
+        return await ctx.reply("You need **Ban Members** permission.", mention_author=False)
+    if not can_moderate(ctx, member):
+        return await ctx.reply("I can't moderate that member because of role hierarchy or permissions.", mention_author=False)
+    try:
+        await member.ban(reason=f"{ctx.author}: {reason}", delete_message_seconds=0)
+        record_mod_action(ctx.guild.id, ctx.author.id, member.id, "Ban", reason)
+        await ctx.reply(f"🔨 Banned **{member}**. Reason: {reason}", mention_author=False)
+    except discord.Forbidden:
+        await ctx.reply("I need **Ban Members** permission and a higher role than that member.", mention_author=False)
+
+
+@bot.command(name="hb")
+@commands.guild_only()
+async def hardban_shortcut(ctx: commands.Context, user_id: int, *, reason: str = "Hard ban"):
+    """Usage: ,hb USER_ID ?r reason. Deletes the last 7 days of messages."""
+    reason = parse_reason_marker(reason, "Hard ban")
+    if not ctx.author.guild_permissions.ban_members:
+        return await ctx.reply("You need **Ban Members** permission.", mention_author=False)
+    if ctx.author.id == user_id or user_id == ctx.guild.owner_id:
+        return await ctx.reply("You can't hard-ban yourself or the server owner.", mention_author=False)
+    try:
+        await ctx.guild.fetch_ban(discord.Object(id=user_id))
+        return await ctx.reply("That user is already banned.", mention_author=False)
+    except discord.NotFound:
+        pass
+    except discord.HTTPException:
+        pass
+    try:
+        await ctx.guild.ban(discord.Object(id=user_id), reason=f"Hard ban by {ctx.author}: {reason}", delete_message_seconds=604800)
+        record_mod_action(ctx.guild.id, ctx.author.id, user_id, "Hard ban (7-day message deletion)", reason)
+        await ctx.reply(f"⛔ Hard-banned user ID `{user_id}` and deleted up to 7 days of their messages. Reason: {reason}", mention_author=False)
+    except discord.Forbidden:
+        await ctx.reply("I need **Ban Members** permission to hard-ban users.", mention_author=False)
+    except discord.HTTPException as exc:
+        await ctx.reply(f"Discord rejected the hard ban: {exc}", mention_author=False)
+
+
+@bot.command(name="ms")
+@commands.guild_only()
+async def modstats_shortcut(ctx: commands.Context, moderator: Optional[discord.Member] = None):
+    """Usage: ,ms [@moderator]. Shows recent actions performed by you, or the mentioned moderator (staff only)."""
+    moderator = moderator or ctx.author
+    if moderator.id != ctx.author.id and not is_staff(ctx.author):
+        return await ctx.reply("You can only view your own mod stats unless you're server staff.", mention_author=False)
+    with db_connect() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS mod_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, moderator_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL, created_at REAL NOT NULL)""")
+        rows = con.execute("SELECT action,target_id,reason,created_at FROM mod_actions WHERE guild_id=? AND moderator_id=? ORDER BY id DESC LIMIT 10",
+                           (ctx.guild.id, moderator.id)).fetchall()
+        total = con.execute("SELECT COUNT(*) FROM mod_actions WHERE guild_id=? AND moderator_id=?", (ctx.guild.id, moderator.id)).fetchone()[0]
+    embed = discord.Embed(title=f"Mod stats · {moderator.display_name}", description=f"Recorded actions: **{total}** · Showing latest {len(rows)}", color=discord.Color.dark_grey())
+    if not rows:
+        embed.description = "No recorded moderation actions yet. New `,m`, `,k`, `,b`, and `,hb` actions will appear here."
+    for i, row in enumerate(rows, 1):
+        embed.add_field(name=f"{i}. {row['action']} · <t:{int(row['created_at'])}:R>",
+                        value=f"Target: <@{row['target_id']}> (`{row['target_id']}`)\nReason: {row['reason'][:500]}", inline=False)
+    await ctx.reply(embed=embed, mention_author=False)
+
+
 # Additional moderation and community commands in the clean rebuild.
 @bot.tree.command(name="timeout", description="Timeout a member")
 @app_commands.describe(member="Member to timeout", minutes="Duration in minutes", reason="Reason")
@@ -744,36 +885,15 @@ async def serverinfo_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="automod", description="Enable or disable ourhope automatic link/spam protection")
-@app_commands.describe(feature="Protection to configure", enabled="Whether the protection should be enabled")
-@app_staff_check()
-async def automod_slash(interaction: discord.Interaction, feature: str, enabled: bool):
-    if not interaction.guild:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    if feature not in {"anti_link", "anti_spam"}:
-        return await interaction.response.send_message("Feature must be `anti_link` or `anti_spam`.", ephemeral=True)
-    settings = guild_settings(interaction.guild.id)
-    settings[feature] = "true" if enabled else "false"
-    with db_connect() as con:
-        con.execute("CREATE TABLE IF NOT EXISTS guild_settings (guild_id INTEGER PRIMARY KEY, settings TEXT NOT NULL DEFAULT '{}')")
-        con.execute("INSERT INTO guild_settings(guild_id,settings) VALUES(?,?) ON CONFLICT(guild_id) DO UPDATE SET settings=excluded.settings", (interaction.guild.id, json.dumps(settings)))
-    await interaction.response.send_message(f"{feature.replace('_', ' ').title()} is now **{'enabled' if enabled else 'disabled'}**.", ephemeral=True)
-
-@bot.tree.command(name="help", description="Show ourhope's main commands")
-async def help_slash(interaction: discord.Interaction):
-    embed = discord.Embed(title="♡ ourhope commands", description="Tickets, giveaways, blacklist and moderation.", color=discord.Color.dark_grey())
-    embed.add_field(name="Giveaways", value="`/giveaway` · `/reroll`", inline=False)
-    embed.add_field(name="Tickets", value="`/ticketpanel` · `/tickettranscript`", inline=False)
-    embed.add_field(name="Moderation", value="`/timeout` · `/kick` · `/ban` · `/purge` · `/warn` · `/warnings`", inline=False)
-    embed.add_field(name="Community", value="`/suggest` · `/serverinfo` · `/automod`", inline=False)
-    embed.add_field(name="Blacklist", value="`?bl` / `?blacklist` · `?unbl` / `?unblacklist`", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 async def main():
-    token = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+    token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
-        raise RuntimeError("Missing DISCORD_BOT_TOKEN variable in Railway. Add your Discord bot token under Variables.")
+        print(f"Welcome to {BOT_NAME} setup.")
+        print("Paste your bot token below. It is not written to a file.")
+        token = getpass.getpass("Discord bot token: ").strip()
+    if not token:
+        print("No token entered. Exiting.")
+        return
     await bot.start(token)
 
 
